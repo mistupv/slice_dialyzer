@@ -1,4 +1,4 @@
--module(e2).
+-module(e7).
 
 -export([main/1]).
 
