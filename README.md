@@ -21,4 +21,4 @@ make
 
 After this run Dialyzer with the slicing features with:
 
-./bin/dialyzer --slice <example_file>
+./bin/dialyzer --slice FILE
