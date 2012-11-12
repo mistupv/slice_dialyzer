@@ -3,11 +3,6 @@
 -export([main/1]).
 
 main(X)->
-%	case X of
-%	     1 -> a;
-%	     2 -> b;
-%	     3 -> c
-%	end,
 	case X of
 	     1 -> a;
 	     3 -> c

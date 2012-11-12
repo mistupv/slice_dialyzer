@@ -185,6 +185,7 @@ analyze_scc(SCC, NextLabel, CallGraph, Plt, PropTypes,FunLbl) ->
   State1 = new_state(SCC, NextLabel, CallGraph, Plt, PropTypes, FunLbl),
   DefSet = add_def_list([ Var || {_MFA, {Var, _Fun}, _Rec} <- SCC],
   						 [], {sets:new(),dict:new()}),
+  put(cases,[]),
   State2 = traverse_scc(SCC, DefSet, State1),
   [{{_,Fun,Arity},_,_}|_] = SCC,%{Fun,Arity}={module_info, 0},
   %-> DEBUG_INFO
@@ -375,6 +376,9 @@ traverse(Tree, DefinedVars, State) ->
       Arg = cerl:case_arg(Tree),
       Clauses = filter_match_fail(cerl:case_clauses(Tree)),
       {State1, ArgVar,ArgLbl} = traverse(Arg, DefinedVars, State),
+      %LastClause = lists:last(Clauses),
+      CasesInfo = get(cases),
+      put(cases,[{cerl:get_ann(Tree),ArgVar,Clauses}|CasesInfo]),
       handle_clauses(Clauses, mk_var(Tree), ArgVar, DefinedVars,[cerl_trees_:get_label(Tree)], ArgLbl, State1);
     call ->
       handle_call(Tree, DefinedVars, State);
@@ -1852,6 +1856,320 @@ get_bif_test_constr(Dst, Arg, Type, State) ->
   DstV = mk_fun_var(DstFun, [Arg]),
   mk_conj_constraint_list([mk_constraint(Dst, sub, DstV),
 			   mk_constraint(Arg, sub, ArgV)]).
+			   
+			   
+			   
+%%=============================================================================
+%%
+%%  Errors inference.
+%%
+%%=============================================================================
+
+infer_errors(Fun,Solution,State,TreeDict) ->
+	Cs = state__get_cs_slicing(Fun, State),
+	%ppDictSol(dict:to_list(Solution)),
+	%io:format("Cs: ~p\n",[Cs]),
+	%io:format("Res: ~p\n",[infer_case_covering(Cs,Solution,State,TreeDict)]),
+	CaseErrors = 
+		try 
+		 infer_case_covering(Cs,TreeDict,Solution)
+	        catch
+	          _:_ -> []
+	        end,
+        ListErrors = 
+		try 
+		 infer_improper_list(Cs,Solution,State,TreeDict)
+	        catch
+	          _:_ -> []
+	        end,
+	%io:format("{CaseErrors,ListErrors}: ~w\n",[{CaseErrors,ListErrors}]),
+	CaseErrors++ListErrors.
+
+infer_improper_list(Cs,Solution,State,TreeDict)->
+	infer_improper_list_1(Cs,dict:to_list(Solution),Solution,State,TreeDict).
+
+infer_improper_list_1(Cs,[{Id,TypeLbls} | TypesLbls],Solution,State,TreeDict) ->
+	[{Type,Lbls}|_] = lists:reverse(TypeLbls),
+	LblsIL = 
+	 case erl_types:t_is_cons(Type) of
+	      true -> 
+	      	%check whether some of the labels corresponds to a case expresion (TreeDict is used for that)
+	      	Consts = look_for_associated_consts(Id,Cs),
+	      	case look_for_list_tail(Consts) of
+	      	     [] -> [];
+	      	     [ListsTail|_] -> 
+		      	ErrLbls = find_no_lists(ListsTail,Solution),
+		      	case ErrLbls of 
+		      	     [] -> [];
+		      	     _ -> 
+			      	clean_lbls(remove_duplicates(ErrLbls++Lbls),TreeDict)
+			end
+		 end;
+	      false -> 
+	      	[]
+	 end,
+	case LblsIL of
+	     [] -> 
+	     	infer_improper_list_1(Cs,TypesLbls,Solution,State,TreeDict);
+	     _ -> 
+		[{0,0,0,LblsIL,0,0}|infer_improper_list_1(Cs,TypesLbls,Solution,State,TreeDict)]
+	end;
+infer_improper_list_1(_,[],_,_,_) -> [].
+
+clean_lbls(LblProducing,TreeDict) ->
+	LblErrors = lists:sort(LblProducing),
+	LabelsInside = calculate_inside_labels(TreeDict,LblErrors),
+	discard_outermost_labels(LabelsInside).
+	
+look_for_associated_consts(Id,C) ->
+	case C of
+	     #constraint_list_slicing{} ->
+	        lists:flatten([look_for_associated_consts(Id,C_) || C_ <- C#constraint_list_slicing.list]);
+	     #constraint_slicing{} ->
+	     	case C#constraint_slicing.cs#constraint.lhs of
+	     	     {_,_,Id,_} -> [C];
+	     	     _ -> 
+	     	     	case C#constraint_slicing.cs#constraint.rhs of
+	     	     	     {_,_,Id,_} -> [C];
+	     	     	     _ -> []
+	     	     	end
+	     	end;
+	     _ -> []
+	end.	
+	     	
+look_for_list_tail([{constraint_slicing,{constraint,_,sub,{fun_var,_,Args},_},_}|Cs]) ->
+        Tail = hd(Args),
+	[Tail|look_for_list_tail(Cs)];
+look_for_list_tail([_|Cs]) ->
+	look_for_list_tail(Cs);
+look_for_list_tail([]) ->
+	[].
+	
+find_no_lists(T,Solution) -> 
+	case dict:find(T,Solution) of
+	     {ok,His} ->
+	        {Current,_} = lists:last(His),
+	        case erl_types:t_is_subtype(erl_types:t_cons(),Current) of
+	             true -> [];
+	             false -> 
+	     		extract_first_no_list(His)
+	     	end;
+	     _ -> 
+	     	[]
+	end.
+	
+extract_first_no_list([{Type,Lbls}|Ts]) -> 
+	case erl_types:t_is_subtype(erl_types:t_cons(),Type) of
+	     true -> extract_first_no_list(Ts);
+	     false -> Lbls
+	end;
+extract_first_no_list([]) -> [].
+
+infer_case_covering(Cs,Tree,Solution) -> 
+	%io:format("CASE VARS: ~p\n",[get_case_vars(Cs)]),
+	CaseVars = get_case_vars(Cs),
+	infer_case_covering_1(CaseVars,Solution,Tree).
+	
+infer_case_covering_1([{Vars,_}|VarLbls],Sol,Tree) ->
+	%io:format("{Vars,Lbls}: ~w\n",[{Vars,Lbls}]),
+	CaseVar = hd(Vars),
+	Value = case dict:find(CaseVar,Sol) of
+	                {ok,Value_} -> Value_;
+	                _ -> no_value
+		end,
+	%io:format("Value: ~w\n",[Value]),
+	%io:format("get(cases): ~p\n\n\nTOTAL: ~p\n",[get(cases),length(get(cases))]),
+	InfoCase = [{Ann,Clauses} || {Ann,{c,var,CaseVar_,_},Clauses} <- get(cases),CaseVar_ =:= CaseVar],
+	%io:format("info_case: ~p\n",[InfoCase]), 
+	case InfoCase of
+	       [] -> 
+	       	  infer_case_covering_1(VarLbls,Sol,Tree);
+	       [{_,Clauses}|_] ->
+	          RhsLbls = get_rhs_vars(Clauses),
+	          %io:format("RhsLbls: ~p\n",[lists:sort(RhsLbls)]),
+	          {ErrorLbls_,_} = search_problematic_clauses(Clauses,Value,{erl_types:t_none(),[]},RhsLbls),
+	          ErrorLbls__ = 
+	            [{sets:to_list(sets:subtract(sets:from_list(ErrorLbl), sets:from_list(RhsLbls))),Always} ||
+	              {ErrorLbl,Always} <- ErrorLbls_],       
+	          %io:format("ErrorLbls__: ~w\n",[lists:sort(ErrorLbls__)]),
+	          %io:format("ErrorLbls_: ~p\n",[ErrorLbls_]),
+	          [{0,0,0,Cleaned++Always,0,0} || 
+	             {LErrorLbls,Always} <- ErrorLbls__, 
+	             (Cleaned = clean_lbls(remove_duplicates(LErrorLbls),Tree)) =/=[]]
+	          ++ infer_case_covering_1(VarLbls,Sol,Tree)
+	          
+	end;
+infer_case_covering_1([],_,_) -> [].
+
+
+search_problematic_clauses([C|Cs],Value,AccType,Removable0) -> 
+	[Pat|_] = cerl:clause_pats(C),
+	LblC = 
+	      try
+	        [cerl_trees_:get_label(C)]
+	      catch
+	      	{missing_label, _} -> []
+	      end,
+	TypePat = get_type_pat(Pat),
+	%io:format("TypePats: ~w\n",[TypePat]),
+	ProbPat = check_problematic_pattern(TypePat,Value,AccType),
+	%io:format("ProbPat: ~w\n",[ProbPat]), 
+	case ProbPat of
+	     [] -> 
+	       case TypePat of
+	            {no_type,Lbls} -> 
+	            	search_problematic_clauses(Cs,Value,AccType,Removable0++Lbls);
+	            {var,Lbls} -> 
+	            	search_problematic_clauses(Cs,Value,AccType,Removable0++Lbls);
+	            {Type,Lbls} ->  
+	            	{TypeAcc,LblAcc} = AccType,
+	            	search_problematic_clauses(Cs,Value,
+	            	                           {erl_types:t_sup(TypeAcc,Type),
+	            	                           Lbls++LblAcc},
+	            	                           Removable0++Lbls)
+	        end;
+	      _ -> 
+	      	case TypePat of
+	      	     {var,Lbls} ->
+	      	        {Prob,Removable} = search_problematic_clauses(Cs,Value,AccType,Removable0++Lbls),
+	      	        %CleanedProb = sets:to_list(sets:subtract(sets:from_list(ProbPat), sets:from_list(Removable))),
+	      	        %{[{CleanedProb,LblC}|Prob],Removable};
+	      	        {[{ProbPat,LblC}|Prob],Removable};
+	      	      _ -> 
+	      	        {Prob,Removable} = search_problematic_clauses(Cs,Value,AccType,Removable0),
+	      	        %io:format("{ProbPat,Removable}: ~w\n",[{lists:sort(remove_duplicates(ProbPat)),lists:sort(remove_duplicates(Removable))}]),
+	      	        CleanedProb = sets:to_list(sets:subtract(sets:from_list(ProbPat), sets:from_list(Removable))),
+	      	        {[{CleanedProb,[]}|Prob],Removable}
+	      	end
+	end;
+search_problematic_clauses([],_,_,Removable) -> {[],Removable}.
+
+check_problematic_pattern(TypePat,Value,AccType) ->
+	case TypePat of
+	     {var,Lbls} ->
+	     	LastValue = lists:last(Value),
+	     	{ValueType,LblsValue} = LastValue,
+	     	{TypeAcc,LblAcc} = AccType,
+		SubType = erl_types:t_is_subtype(TypeAcc,ValueType),
+		case SubType of
+		     true -> Lbls++LblAcc++LblsValue;
+		     false -> []
+		end;
+	      {no_type,_} -> [];
+	      {TypeP,Lbls} ->
+	      	LastValue = lists:last(Value),
+	      	{ValueType,LblsValue} = LastValue,
+	      	SubType = erl_types:t_is_subtype(TypeP,ValueType),
+	      	case SubType of
+	      	     true -> [];
+	      	     false ->
+	      	        %io:format("{LblsValue,Lbls}: ~w\n",[{lists:sort(remove_duplicates(LblsValue)),lists:sort(remove_duplicates(Lbls))}]), 
+	      	        LblsValue++Lbls
+	      	end
+	end.
+	
+get_type_pat(P) ->
+      Unfolded = cerl:unfold_literal(P),
+      Lbl = 
+	      try
+	        [cerl_trees_:get_label(P)]
+	      catch
+	      	{missing_label, _} -> []
+	      end,
+      TypeP = 
+	      case cerl:type(Unfolded) of
+		 'literal' ->
+			  {t_from_term(cerl:concrete(P)),Lbl};
+		 'var' ->
+		   	{var,Lbl};
+		  _ ->
+		   	{no_type,Lbl}
+	      end,
+       TypeP.
+       
+get_rhs_vars([C|Cs]) ->
+	Body = cerl:clause_body(C),
+	RhsVarsC = 
+	  cerl_trees_:fold(
+	    fun(Tree,Acc) -> 
+	        try
+	          [cerl_trees_:get_label(Tree)|Acc]
+	        catch
+	      	  {missing_label, _} -> []
+	        end
+	     end,[] , Body),
+	RhsVarsC ++ get_rhs_vars(Cs);
+get_rhs_vars([]) -> [].
+
+
+get_case_vars(C) ->
+	case C of
+	     #constraint_list_slicing{} ->
+	        case C#constraint_list_slicing.type of
+	             'conj' -> 
+	                lists:flatten([get_case_vars(C_) ||
+	     		          C_ <- C#constraint_list_slicing.list]);
+	             'disj' -> 
+	                {Vars,Lbls} = look_for_case_vars_list(C#constraint_list_slicing.list),
+	                NVars = remove_non_duplicated(lists:sort(Vars)),
+			NLbls = remove_non_duplicated(lists:sort(Lbls)),
+	             	NLists_ = [get_case_vars(C_) ||
+	     		           C_ <- C#constraint_list_slicing.list],
+	     		[{NVars,NLbls}|lists:flatten(NLists_)];
+	             _ ->
+	             	[]
+	        end;
+	     _ -> []
+	end. 
+
+look_for_case_vars_list([C|Cs]) ->
+        %io:format("\nC: ~p\n",[C]),
+        {VarsCs,LblsCs} = look_for_case_vars_list(Cs),
+        {VarsC,LblsC} =
+	case C of
+	     #constraint_list_slicing{} ->
+	        case C#constraint_list_slicing.type of
+	             'conj' -> 
+	                look_for_case_vars(C#constraint_list_slicing.list);
+	             'disj' -> 
+	             	{[],[]};
+	             _ ->
+	             	{[],[]}
+	        end;
+	     _ -> {[],[]}
+	end,
+	{VarsC++VarsCs,LblsC++LblsCs};
+look_for_case_vars_list([]) -> {[],[]}.
+
+look_for_case_vars([C|Cs]) ->
+	{VarsCs,LblsCs} = look_for_case_vars(Cs),
+	{VarsC,LblsC} =
+	case C of 
+	     #constraint_slicing{} ->
+	     	case C#constraint_slicing.cs#constraint.lhs of
+	     	     {c,var,Id1,_} -> 
+	     	     	case C#constraint_slicing.cs#constraint.rhs of
+	     	     	     {c,var,Id2,_} -> {[Id1,Id2],C#constraint_slicing.lbls};
+	     	     	     _ -> {[Id1],C#constraint_slicing.lbls}
+	     	     	end;
+	     	     _ -> 
+	     	     	case C#constraint_slicing.cs#constraint.rhs of
+	     	     	     {c,var,Id2,_} -> {[Id2],C#constraint_slicing.lbls};
+	     	     	     _ -> {[],[]}
+	     	     	end
+	     	end;
+	     _ -> {[],[]}
+	 end,
+	 {remove_duplicates(VarsC ++ VarsCs), remove_duplicates(LblsC ++ LblsCs)};
+look_for_case_vars([]) -> {[],[]}.
+
+remove_non_duplicated([E1,E2|T]) ->
+	case E1 =:= E2 of
+	     true -> [E1 | remove_non_duplicated([E || E <- T, E =/= E1])];
+	     false -> remove_non_duplicated([E2|T])
+	end;
+remove_non_duplicated(_) -> [].
+
 
 %%=============================================================================
 %%
@@ -1877,23 +2195,35 @@ solve_fun(Fun, FunMap, State) ->
   Ref = mk_constraint_ref(Fun, Deps),
   %% Note that functions are always considered to succeed.
   {ok, _MapDict, NewMap,MapSlicing,ErrorInfo} = solve_ref_or_list(Ref, FunMap, dict:new(), dict:new(), State),
+  %io:format("ErrorInfo: ~p\n",[ErrorInfo]),
   NewType = lookup_type(Fun, NewMap),
   %io:format("Fun: ~p\nCs: ~p\n",[Fun,Cs]),
   TypeVar = lookup_type_var_cs(Fun,Cs),
-  %io:format("Args: ~p\nRangue: ~p\n",
-  %	    [erl_types:t_fun_args(TypeVar),erl_types:t_fun_range(TypeVar)]),
+%  io:format("Args: ~p\nRangue: ~p\n",
+%  	    [erl_types:t_fun_args(TypeVar),erl_types:t_fun_range(TypeVar)]),
   case erl_types:t_is_fun(TypeVar) of
        true -> Lbl = look_for_args_lbl(erl_types:t_fun_args(TypeVar)++[erl_types:t_fun_range(TypeVar)],MapSlicing);
        false -> Lbl = []
   end,
+  %io:format("\nSlicingMapping: \n",[]),
+  %ppDictSol(dict:to_list(MapSlicing)),
   %io:format("Lbl: ~w\n",[Lbl]),
+  %Pid = self(),
+%  spawn(fun() -> Res = infer_errors(Fun,MapSlicing,State,TreeDict),Pid!{ended,Res} end),
+%  InferredErrors = 
+%	  receive 
+%	  	{ended,Res} -> Res
+%	  after
+%	  	100 -> []
+%	  end,
+  InferredErrors = infer_errors(Fun,MapSlicing,State,get(tree)),
   NewFunMap1 =
    case state__get_rec_var(Fun, State) of
 		 error -> FunMap;
 		 {ok, Var} -> enter_type(Var, NewType, FunMap)
 	       end,
   FinalMap = enter_type(Fun, NewType, NewFunMap1),
-  {FinalMap,dict:from_list([{Fun,Lbl}]),ErrorInfo}.
+  {FinalMap,dict:from_list([{Fun,Lbl}]),ErrorInfo++InferredErrors}.
   
 lookup_type_var_cs(Fun,{constraint_list,_,Cs,_,_})->
    lookup_type_var_cs_list(Fun,Cs).
@@ -1994,9 +2324,9 @@ scc_fold_fun(F, FunMap, State) ->
 		error ->
 		  enter_type(F, NewType, FunMap)
 	      end,
-  io:format("\nDone solving for function ~w\n", [F]),
-  io:format("\nMapping:~n"),
-  ppDictSol(dict:to_list(NewFunMap)),
+  %io:format("\nDone solving for function ~w\n", [F]),
+  %io:format("\nMapping:~n"),
+  %ppDictSol(dict:to_list(NewFunMap)),
   ?debug("Done solving for function ~w :: ~s\n", [debug_lookup_name(F),
 						  format_type(NewType)]),
   {NewFunMap,Lbl,ErrorInfo}.
@@ -2040,8 +2370,8 @@ calculate_inside_labels(TreeDict,[Lbl|Lbls]) ->
 calculate_inside_labels(_,[]) -> [].
 
 discard_outermost_labels([{Lbl,InsideLbls}|Lbls]) ->
-   DiscartedLbls = [LblTuple || LblTuple = {_,InsideLbls_}<-Lbls,Lbl_ <- InsideLbls_,Lbl_ == Lbl],
-   FilteredLbls =  [LblTuple || LblTuple<-Lbls,lists:member(LblTuple,DiscartedLbls)==false],
+   DiscardedLbls = [LblTuple || LblTuple = {_,InsideLbls_} <- Lbls,Lbl_ <- InsideLbls_,Lbl_ == Lbl],
+   FilteredLbls =  [LblTuple || LblTuple<-Lbls,lists:member(LblTuple,DiscardedLbls)==false],
    case [Lbl1||Lbl1<-InsideLbls,{Lbl2,_}<-Lbls,Lbl1==Lbl2] of
         [] -> [Lbl | discard_outermost_labels(FilteredLbls)];
         _ -> discard_outermost_labels(FilteredLbls)
@@ -2188,6 +2518,8 @@ solve_ref_or_list(#constraint_list{type=Type, list = Cs, deps = Deps, id = Id} ,
   
 solve_ref_or_list(#constraint_list_slicing{type=Type, list = Cs, deps = Deps, id = Id} ,Map, MapDict, MapSlicing, State) ->
   %solve_ref_or_list_1(Type,lists:reverse(Cs),Deps,Id,Map, MapDict, MapSlicing, State).
+  %io:format("ENTRA\n"),
+  %ppDictSol(dict:to_list(MapSlicing)),
   solve_ref_or_list_1(Type,Cs,Deps,Id,Map, MapDict, MapSlicing, State).
   
 solve_ref_or_list_1(Type,Cs,Deps,Id,Map, MapDict_, MapSlicing, State)->
@@ -2256,16 +2588,16 @@ solve_self_recursive(Cs, Map, MapDict, MapSlicing, Id, RecType0, State) ->
   end.
   
   
-ppDictSol([{Id,Type}|Sol])->
-   %io:format("Type:~w\n",[Type]),
-   %Printed = (catch io:format("\tID: ~w TYPE: ~w\n",[Id,remove_duplicates(ppDictSol(dict:to_list(Type)))])),
-   %case Printed of
-   %     ok -> ok;
-   	%_ -> 
-          io:format("\tID: ~w TYPE: ~w\n",[Id,remove_duplicates(Type)]),
-   %end,
-   ppDictSol(Sol);
-ppDictSol([])->ok.
+%ppDictSol([{Id,Type}|Sol])->
+%   %io:format("Type:~w\n",[Type]),
+%   %Printed = (catch io:format("\tID: ~w TYPE: ~w\n",[Id,remove_duplicates(ppDictSol(dict:to_list(Type)))])),
+%   %case Printed of
+%   %     ok -> ok;
+%   	%_ -> 
+%          io:format("\tID: ~w TYPE: ~w\n",[Id,remove_duplicates(Type)]),
+%   %end,
+%   ppDictSol(Sol);
+%ppDictSol([])->ok.
 
 solve_clist(Cs, conj, Id, Deps, MapDict, Map, MapSlicing, State) ->
   case solve_cs(Cs, Map, MapDict, MapSlicing, State) of
@@ -2399,10 +2731,10 @@ solve_subtype(Type, Inf, Map, Opaques) ->
   
 solve_one_c(#constraint{lhs = Lhs, rhs = Rhs, op = Op}, Map, 
             MapSlicing, Opaques, Lbl, VarLbl) ->
-%  io:format("\n\nRestriccion: ~p~n",[{Lhs,Op,Rhs}]),
+  %io:format("\n\nRestriccion: ~p~n",[{Lhs,Op,Rhs,erl_types:t_is_var(Lhs),erl_types:t_is_var(Rhs)}]),
   LhsType = lookup_type(Lhs, Map),
   RhsType = lookup_type(Rhs, Map),
-%  io:format("\n\nTypes: ~p~n",[{LhsType,RhsType}]),
+  %io:format("\n\nTypes: ~p~n",[{LhsType,RhsType}]),
 %  io:format("Map: \n"),
 %  ppDictSol(dict:to_list(Map)),
 %  io:format("MapSlicing: \n"),
@@ -2468,7 +2800,7 @@ solve_one_c(#constraint{lhs = Lhs, rhs = Rhs, op = Op}, Map,
   end.
 
 solve_subtype(Type, Inf, Map, MapSlicing, Opaques,Lbl,LblOther, VarLbl) ->
-%      io:format("\nType:~p\nInf:~p\n",[Type,Inf]),
+      %io:format("\nType:~p\nInf:~p\n",[Type,Inf]),
       try t_unify(Type, Inf, Opaques) of
 		{_, List} -> 
 %		  io:format("List: ~w\nLbl: ~w\nLblOther: ~w\nMapSlicing:\n",[List,Lbl,LblOther]),
@@ -2643,12 +2975,11 @@ join_one_key_slicing_([],TypeLbl) -> TypeLbl.
 %  [lookup_type_slicing(X, Map) || X <- List]. 
 
   
-lookup_type_slicing(Key, Map)  ->
+lookup_type_slicing(Key, Map) ->
   case dict:find(Key, Map) of
     error -> [];
     {ok, Val} -> Val
   end.
-  
 
 %% ============================================================================
 %%

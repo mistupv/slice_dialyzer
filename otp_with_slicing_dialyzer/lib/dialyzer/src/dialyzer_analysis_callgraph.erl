@@ -423,7 +423,7 @@ label_core(Core, CServer) ->
   %{LabeledTree, NewNextLabel} = cerl_trees:label(CoreTree, NextLabel),
   {LabeledTree_, _} = cerl_trees_:label(CoreTree, NextLabel),
   {LabeledTree, NewNextLabel} = cerl_trees:label(LabeledTree_, NextLabel),
-  %io:format("~p~n",[LabeledTree]),
+  %io:format("\nTree:\n ~p~n",[LabeledTree]),
   {cerl:to_records(LabeledTree),
    dialyzer_codeserver:set_next_core_label(NewNextLabel, CServer)}.
 

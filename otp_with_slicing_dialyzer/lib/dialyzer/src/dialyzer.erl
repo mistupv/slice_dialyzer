@@ -302,8 +302,10 @@ format_warning({_Tag, {File, Line}, Msg}, FOpt) when is_list(File),
 	basename -> filename:basename(File)
       end,
   String = lists:flatten(message_to_string(Msg)),
+  %io:format("Msg: ~p\n",[Msg]),
   {ok, DeviceSerialR} = file:open("errors.temp", [read]),
   Errors=io:get_line(DeviceSerialR,""),
+  %io:format("Errors: ~p\n",[Errors]),
   ok = file:close(DeviceSerialR),
   {ok,Tokens,_EndLine} = erl_scan:string(Errors++"."),
   {ok,AbsForm} = erl_parse:parse_exprs(Tokens),
@@ -332,7 +334,7 @@ get_addtional_info([Lbls|TailLbls],Tree,Line,F,File) ->
   %io:format("\n\n\nLines:~w\n\n\n",[dict:fetch_keys(dict:from_list(LineNum))]),
   %io:format("\n\nLineNum:~w\n\n",[LineNum]),
   Slice = get(dialyzer_slice),
-  case Slice =:= true andalso is_line_in(Line, LineNum) of
+  case Slice =:= true andalso is_line_in(Line, LineNum)  of
     true -> format_additional_info(LineNum,F,File,Tree);
     false -> get_addtional_info(TailLbls,Tree,Line,F,File)
   end;
@@ -356,18 +358,26 @@ is_line_in(Line,[_ | Tail]) -> is_line_in(Line,Tail);
 is_line_in(_,[]) -> false.
 
 format_additional_info(LineNum, F, File, Tree) ->
+   MaxLine = lists:max([length(integer_to_list(Line)) || {Line,_} <- LineNum]),
    lists:flatten("  discrepancy sources:\n"
-    ++format_additional_info_1(LineNum,F, File, Tree)).
-format_additional_info_1([{Line,Lbls} | LineNum], F, File, Tree) ->
+    ++format_additional_info_1(LineNum,F, File, Tree, MaxLine)).
+    
+format_additional_info_1([{Line,Lbls} | LineNum], F, File, Tree, MaxLine) ->
    {ok, Device} = file:open(File, [read]),
    LineContent_ = look_for_line_content(Device,Line,1),
    [_|LineContent__] = lists:reverse(LineContent_),
    LineContent = lists:reverse(LineContent__),
    ok = file:close(Device),
    LblsInfo = format_lbls(Lbls),
-   lists:flatten(io_lib:format("\t~s:~w ~s ~s\n", [F, Line,LineContent,LblsInfo])
-    ++ format_additional_info_1(LineNum, F, File, Tree));
-format_additional_info_1([], _, _, _) -> [].
+   LineStr_ = integer_to_list(Line),
+   LineStr = 
+	   case length(LineStr_) of
+	        MaxLine -> LineStr_;
+	        _ -> LineStr_++create_spaces(MaxLine-length(LineStr_))
+	   end,
+   lists:flatten(io_lib:format("\t~s:~s ~s ~s\n", [F, LineStr,LineContent,LblsInfo])
+    ++ format_additional_info_1(LineNum, F, File, Tree, MaxLine));
+format_additional_info_1([], _, _, _, _) -> [].
    
 look_for_line_content(Device, Line,Line) ->
     case io:get_line(Device, "") of
@@ -379,6 +389,10 @@ look_for_line_content(Device, Line,N) ->
         eof  -> "";
         _ -> look_for_line_content(Device, Line,N+1)
     end.
+
+create_spaces(0) -> "";
+create_spaces(N) -> 
+	[" "|create_spaces(N-1)].
 
 format_lbls(Nodes) ->
    case format_lbls_1(Nodes) of

@@ -414,8 +414,13 @@ find_succ_types_for_scc(SCC_Info, Contracts,
 	         {value,Lbls_,_} -> Lbls_;
 	         _ -> []
 	    end,
-	  [{_,_,_,LblsError_,_,_}] = InfoErrors,
-	  LblsError = join_lbl_errors(LblsError_,LblsErrorsPrev),
+	  LblsErrorList = [LblsError_ || {_,_,_,LblsError_,_,_} <-InfoErrors], % This could be really improved. There is a lot of information about the error, but only its labels are used.
+	  %io:format("LblsErrorList: ~w\n",[LblsErrorList]),
+	  LblsError = lists:foldl(
+	                 fun(LblsError_, LblsErrorsPrev_) -> 
+	                    join_lbl_errors(LblsError_,LblsErrorsPrev_) 
+	                end, LblsErrorsPrev, LblsErrorList),
+	  %LblsError = join_lbl_errors(LblsError_,LblsErrorsPrev),
 	  {ok, DeviceSerial} = file:open("errors.temp", [write]),
 	  io:write(DeviceSerial,LblsError),
 	  ok = file:close(DeviceSerial)
