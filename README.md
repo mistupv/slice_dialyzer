@@ -9,7 +9,7 @@ Due to  the last changes in Dialyzer the slicer is being adapted to
 the new PLT tables.
 
 
-Untar the file otp_with_slicing_dialyzer.tar.gz, then run the following commands:
+Inside the directory otp_with_slicing_dialyzer run the following commands:
 
 ./otp_build autoconf
 
