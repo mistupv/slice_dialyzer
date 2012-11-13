@@ -378,7 +378,7 @@ traverse(Tree, DefinedVars, State) ->
       {State1, ArgVar,ArgLbl} = traverse(Arg, DefinedVars, State),
       %LastClause = lists:last(Clauses),
       CasesInfo = get(cases),
-      put(cases,[{cerl:get_ann(Tree),ArgVar,Clauses}|CasesInfo]),
+      put(cases,[{cerl_trees_:get_label(cerl:case_arg(Tree)),ArgVar,Clauses}|CasesInfo]),
       handle_clauses(Clauses, mk_var(Tree), ArgVar, DefinedVars,[cerl_trees_:get_label(Tree)], ArgLbl, State1);
     call ->
       handle_call(Tree, DefinedVars, State);
@@ -1979,15 +1979,15 @@ infer_case_covering_1([{Vars,_}|VarLbls],Sol,Tree) ->
 		end,
 	%io:format("Value: ~w\n",[Value]),
 	%io:format("get(cases): ~p\n\n\nTOTAL: ~p\n",[get(cases),length(get(cases))]),
-	InfoCase = [{Ann,Clauses} || {Ann,{c,var,CaseVar_,_},Clauses} <- get(cases),CaseVar_ =:= CaseVar],
+	InfoCase = [{LblArg,Clauses} || {LblArg,{c,var,CaseVar_,_},Clauses} <- get(cases),CaseVar_ =:= CaseVar],
 	%io:format("info_case: ~p\n",[InfoCase]), 
 	case InfoCase of
 	       [] -> 
 	       	  infer_case_covering_1(VarLbls,Sol,Tree);
-	       [{_,Clauses}|_] ->
+	       [{LblArg,Clauses}|_] ->
 	          RhsLbls = get_rhs_vars(Clauses),
 	          %io:format("RhsLbls: ~p\n",[lists:sort(RhsLbls)]),
-	          {ErrorLbls_,_} = search_problematic_clauses(Clauses,Value,{erl_types:t_none(),[]},RhsLbls),
+	          {ErrorLbls_,_} = search_problematic_clauses(Clauses,LblArg,Value,{erl_types:t_none(),[]},RhsLbls),
 	          ErrorLbls__ = 
 	            [{sets:to_list(sets:subtract(sets:from_list(ErrorLbl), sets:from_list(RhsLbls))),Always} ||
 	              {ErrorLbl,Always} <- ErrorLbls_],       
@@ -2002,7 +2002,7 @@ infer_case_covering_1([{Vars,_}|VarLbls],Sol,Tree) ->
 infer_case_covering_1([],_,_) -> [].
 
 
-search_problematic_clauses([C|Cs],Value,AccType,Removable0) -> 
+search_problematic_clauses([C|Cs],LblArg,Value,AccType,Removable0) -> 
 	[Pat|_] = cerl:clause_pats(C),
 	LblC = 
 	      try
@@ -2018,12 +2018,12 @@ search_problematic_clauses([C|Cs],Value,AccType,Removable0) ->
 	     [] -> 
 	       case TypePat of
 	            {no_type,Lbls} -> 
-	            	search_problematic_clauses(Cs,Value,AccType,Removable0++Lbls);
+	            	search_problematic_clauses(Cs,LblArg,Value,AccType,Removable0++Lbls);
 	            {var,Lbls} -> 
-	            	search_problematic_clauses(Cs,Value,AccType,Removable0++Lbls);
+	            	search_problematic_clauses(Cs,LblArg,Value,AccType,Removable0++Lbls);
 	            {Type,Lbls} ->  
 	            	{TypeAcc,LblAcc} = AccType,
-	            	search_problematic_clauses(Cs,Value,
+	            	search_problematic_clauses(Cs,LblArg,Value,
 	            	                           {erl_types:t_sup(TypeAcc,Type),
 	            	                           Lbls++LblAcc},
 	            	                           Removable0++Lbls)
@@ -2031,18 +2031,18 @@ search_problematic_clauses([C|Cs],Value,AccType,Removable0) ->
 	      _ -> 
 	      	case TypePat of
 	      	     {var,Lbls} ->
-	      	        {Prob,Removable} = search_problematic_clauses(Cs,Value,AccType,Removable0++Lbls),
+	      	        {Prob,Removable} = search_problematic_clauses(Cs,LblArg,Value,AccType,Removable0++Lbls),
 	      	        %CleanedProb = sets:to_list(sets:subtract(sets:from_list(ProbPat), sets:from_list(Removable))),
 	      	        %{[{CleanedProb,LblC}|Prob],Removable};
-	      	        {[{ProbPat,LblC}|Prob],Removable};
+	      	        {[{ProbPat,[LblArg|LblC]}|Prob],Removable};
 	      	      _ -> 
-	      	        {Prob,Removable} = search_problematic_clauses(Cs,Value,AccType,Removable0),
+	      	        {Prob,Removable} = search_problematic_clauses(Cs,LblArg,Value,AccType,Removable0),
 	      	        %io:format("{ProbPat,Removable}: ~w\n",[{lists:sort(remove_duplicates(ProbPat)),lists:sort(remove_duplicates(Removable))}]),
 	      	        CleanedProb = sets:to_list(sets:subtract(sets:from_list(ProbPat), sets:from_list(Removable))),
-	      	        {[{CleanedProb,[]}|Prob],Removable}
+	      	        {[{CleanedProb,[LblArg]}|Prob],Removable}
 	      	end
 	end;
-search_problematic_clauses([],_,_,Removable) -> {[],Removable}.
+search_problematic_clauses([],_,_,_,Removable) -> {[],Removable}.
 
 check_problematic_pattern(TypePat,Value,AccType) ->
 	case TypePat of
