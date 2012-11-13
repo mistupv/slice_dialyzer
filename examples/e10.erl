@@ -4,10 +4,10 @@
 
 main(X) ->
    case X of
-        1 -> 
+        2 -> 
           case X of
-               2 -> a;
-               Y -> Y;
-               _ -> b
+               1 -> a;
+               2 -> b;
+               Y -> Y
           end
    end.
